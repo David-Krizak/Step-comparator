@@ -233,9 +233,12 @@ class ComparatorWindow(QWidget):
         button_row = QHBoxLayout()
         compare_button = QPushButton("Compare")
         compare_button.clicked.connect(self._compare)
+        single_check_button = QPushButton("Check model vs DB")
+        single_check_button.clicked.connect(self._check_single_against_db)
         save_button = QPushButton("Save report as JSON")
         save_button.clicked.connect(self._save_report)
         button_row.addWidget(compare_button)
+        button_row.addWidget(single_check_button)
         button_row.addWidget(save_button)
         button_row.addStretch()
         outer.addLayout(button_row)
@@ -369,6 +372,10 @@ class ComparatorWindow(QWidget):
 
     # -------- Helpers --------
 
+    def _get_existing_matches(self, sig: GeometrySignature) -> list[dict]:
+        """Copy of matches before we possibly add the current signature."""
+        return [dict(m) for m in _find_by_hash(self.db_index, sig.hash_hex)]
+
     def _choose_file(self, widget: QLineEdit) -> None:
         filename, _ = QFileDialog.getOpenFileName(
             self,
@@ -411,11 +418,55 @@ class ComparatorWindow(QWidget):
 
         self.latest_result = result
 
+        # Snapshot known matches before we add the current models to the DB index
+        existing_a = self._get_existing_matches(result.summary_a)
+        existing_b = self._get_existing_matches(result.summary_b)
+
         # Update DB with A and B
         self._update_db_with_signatures(result.summary_a, result.summary_b)
 
         # Refresh UI
-        self._update_ui_with_result(result)
+        self._update_ui_with_result(result, existing_a, existing_b)
+
+    def _check_single_against_db(self) -> None:
+        tol = self._parse_tolerance()
+        if tol is None:
+            return
+
+        file_a = self.file_a_input.text().strip()
+        file_b = self.file_b_input.text().strip()
+        if not file_a and not file_b:
+            QMessageBox.warning(self, "No file", "Select at least one STEP file to check against the DB.")
+            return
+
+        target_label, target_path = ("A", file_a) if file_a else ("B", file_b)
+
+        hasher = GeometryHasher(tol)
+        try:
+            sig = hasher.signature_for_file(target_path)
+        except FileNotFoundError:
+            QMessageBox.critical(self, "File not found", f"File does not exist:\n{target_path}")
+            return
+        except Exception as exc:
+            QMessageBox.critical(self, "Hashing failed", f"Unexpected error while reading file:\n{exc}")
+            return
+
+        matches_before = self._get_existing_matches(sig)
+        _record_model(self.db, self.db_index, sig)
+        try:
+            _save_db(self.db_path, self.db)
+        except Exception as exc:
+            QMessageBox.warning(self, "DB warning", f"Could not save DB:\n{exc}")
+
+        if matches_before:
+            text = self._build_known_models_text(f"Model {target_label}", matches_before)
+        else:
+            text = (
+                f"Model {target_label}: geometrija nije ranije zabilježena u ovoj bazi.\n"
+                f"Dodano je novo pojavljivanje ({Path(target_path).name})."
+            )
+
+        QMessageBox.information(self, "Provjera u bazi", text)
 
     def _update_db_with_signatures(self, sig_a: GeometrySignature, sig_b: GeometrySignature) -> None:
         _record_model(self.db, self.db_index, sig_a)
@@ -425,8 +476,7 @@ class ComparatorWindow(QWidget):
         except Exception as exc:
             QMessageBox.warning(self, "DB warning", f"Could not save DB:\n{exc}")
 
-    def _build_known_models_text(self, sig: GeometrySignature, label: str) -> str:
-        matches = _find_by_hash(self.db_index, sig.hash_hex)
+    def _build_known_models_text(self, label: str, matches: list[dict]) -> str:
         if not matches:
             return f"{label}: geometrija nije ranije zabilježena u ovoj bazi.\n"
         lines = [f"{label}: geometrija već postoji u ovoj bazi, raniji modeli:\n"]
@@ -436,7 +486,12 @@ class ComparatorWindow(QWidget):
             )
         return "".join(lines)
 
-    def _update_ui_with_result(self, result: ComparisonResult) -> None:
+    def _update_ui_with_result(
+        self,
+        result: ComparisonResult,
+        known_matches_a: list[dict],
+        known_matches_b: list[dict],
+    ) -> None:
         # ----- 1) Summary label: ISTI / RAZLIČITI MODELI -----
         if result.exact_match:
             self.summary_label.setText("ISTI MODELI")
