@@ -1,6 +1,9 @@
 import json
+import os
+import subprocess
 import sys
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
 
 from geometry_descriptor import GeometryHasher, GeometrySignature
@@ -19,6 +22,7 @@ try:
         QFileDialog,
         QTextEdit,
         QMessageBox,
+        QTabWidget,
     )
     from PySide6.QtCore import Qt
 except ImportError:
@@ -34,16 +38,97 @@ except ImportError:
         QFileDialog,
         QTextEdit,
         QMessageBox,
+        QTabWidget,
     )
     from PySide2.QtCore import Qt
 
 
-# -------- Data model --------
+# -------- Simple JSON "DB" for known models --------
+
+DEFAULT_DB_PATH = Path.home() / "step_compare_db.json"
+
+
+def _build_hash_index(data: dict) -> dict[str, list[dict]]:
+    """Builds {hash_hex: [model_record, ...]}."""
+    index: dict[str, list[dict]] = {}
+    models = data.get("models", [])
+    if not isinstance(models, list):
+        return index
+    for m in models:
+        h = m.get("hash")
+        if not h:
+            continue
+        index.setdefault(h, []).append(m)
+    return index
+
+
+def _load_db(path: Path) -> tuple[dict, dict[str, list[dict]]]:
+    if not path.is_file():
+        data = {"version": 1, "models": []}
+        return data, _build_hash_index(data)
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        if not isinstance(data, dict):
+            data = {"version": 1, "models": []}
+        if "models" not in data or not isinstance(data["models"], list):
+            data["models"] = []
+        return data, _build_hash_index(data)
+    except Exception:
+        # Corrupt DB → start fresh
+        data = {"version": 1, "models": []}
+        return data, _build_hash_index(data)
+
+
+def _save_db(path: Path, data: dict) -> None:
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(data, f, indent=2)
+    tmp.replace(path)
+
+
+def _find_by_hash(index: dict[str, list[dict]], hash_hex: str) -> list[dict]:
+    return index.get(hash_hex, [])
+
+
+def _record_model(
+    data: dict,
+    index: dict[str, list[dict]],
+    sig: GeometrySignature,
+) -> None:
+    """Add model to DB if not already recorded with same hash+path."""
+    models = data.setdefault("models", [])
+    h = sig.hash_hex
+    p = sig.path
+
+    # Quick check via index
+    existing_list = index.get(h, [])
+    for m in existing_list:
+        if m.get("path") == p:
+            return
+
+    d = sig.descriptor
+    record = {
+        "hash": h,
+        "name": Path(p).name,
+        "path": p,
+        "added": datetime.now().isoformat(timespec="seconds"),
+        "volume": d.volume,
+        "area": d.area,
+        "bbox": list(d.bbox_dims),
+    }
+    models.append(record)
+    index.setdefault(h, []).append(record)
+
+
+# -------- Data model for comparison result --------
 
 @dataclass
 class ComparisonResult:
     summary_a: GeometrySignature
     summary_b: GeometrySignature
+    exact_match: bool
+    metrics: dict[str, float]
 
 
 class StepComparator:
@@ -51,9 +136,17 @@ class StepComparator:
         self.hasher = GeometryHasher(tolerance)
 
     def compare(self, path_a: str, path_b: str) -> ComparisonResult:
+        # 1) Descriptor + hash
         summary_a = self.hasher.signature_for_file(path_a)
         summary_b = self.hasher.signature_for_file(path_b)
-        return ComparisonResult(summary_a, summary_b)
+
+        # 2) Strict boolean verification
+        exact_match, metrics = self.hasher.verify_exact_match(path_a, path_b)
+
+        return ComparisonResult(summary_a, summary_b, exact_match, metrics)
+
+    def export_differences(self, path_a: str, path_b: str, out_dir: Path) -> dict[str, Path]:
+        return self.hasher.export_difference_shapes(path_a, path_b, out_dir)
 
 
 # -------- GUI --------
@@ -61,47 +154,58 @@ class StepComparator:
 class ComparatorWindow(QWidget):
     def __init__(self) -> None:
         super().__init__()
-        self.setWindowTitle("STEP Geometry Comparator")
-        self.resize(900, 700)
+        self.setWindowTitle("STEP Geometry Comparator (Hard Mode)")
+        self.resize(1100, 820)
 
         self.file_a_input: QLineEdit
         self.file_b_input: QLineEdit
         self.tolerance_input: QLineEdit
-        self.output: QTextEdit
+
+        self.db_path_edit: QLineEdit
+
+        self.tabs: QTabWidget
+        self.summary_label: QLabel
+        self.summary_text: QTextEdit
+        self.details_text: QTextEdit
+        self.diff_info_text: QTextEdit
+
         self.latest_result: ComparisonResult | None = None
 
+        # DB state
+        self.db_path: Path = DEFAULT_DB_PATH
+        self.db: dict
+        self.db_index: dict[str, list[dict]]
+
+        self.db, self.db_index = _load_db(self.db_path)
+
         self._build_widgets()
+        self._update_db_path_display()
 
     def _build_widgets(self) -> None:
-        layout = QVBoxLayout(self)
+        outer = QVBoxLayout(self)
 
-        header = QLabel("STEP Geometry Comparator")
-        header.setStyleSheet("font-size: 18pt; font-weight: bold;")
-        layout.addWidget(header)
+        # DB selector row
+        db_row = QHBoxLayout()
+        db_row.addWidget(QLabel("DB JSON:"))
+        self.db_path_edit = QLineEdit(str(self.db_path))
+        self.db_path_edit.setReadOnly(True)
+        db_row.addWidget(self.db_path_edit, stretch=1)
+        db_button = QPushButton("Odaberi DB…")
+        db_button.clicked.connect(self._choose_db_file)
+        db_row.addWidget(db_button)
+        outer.addLayout(db_row)
 
-        description = QLabel(
-            "Compare two STEP files using geometry descriptors "
-            "(volume, area, inertia, histograms, etc.). "
-            "Descriptors are quantized using the tolerance to build "
-            "a stable geometry hash for deduplication."
-        )
-        description.setWordWrap(True)
-        layout.addWidget(description)
-
+        # Top: file selection + tolerance
         form_layout = QGridLayout()
-        layout.addLayout(form_layout)
 
-        # File A
         self.file_a_input = QLineEdit()
         browse_a = QPushButton("Browse")
         browse_a.clicked.connect(lambda: self._choose_file(self.file_a_input))
 
-        # File B
         self.file_b_input = QLineEdit()
         browse_b = QPushButton("Browse")
         browse_b.clicked.connect(lambda: self._choose_file(self.file_b_input))
 
-        # Tolerance
         self.tolerance_input = QLineEdit("0.001")
 
         form_layout.addWidget(QLabel("File A:"), 0, 0, alignment=Qt.AlignRight)
@@ -115,6 +219,8 @@ class ComparatorWindow(QWidget):
         form_layout.addWidget(QLabel("Tolerance:"), 2, 0, alignment=Qt.AlignRight)
         form_layout.addWidget(self.tolerance_input, 2, 1)
 
+        outer.addLayout(form_layout)
+
         # Buttons
         button_row = QHBoxLayout()
         compare_button = QPushButton("Compare")
@@ -124,12 +230,110 @@ class ComparatorWindow(QWidget):
         button_row.addWidget(compare_button)
         button_row.addWidget(save_button)
         button_row.addStretch()
-        layout.addLayout(button_row)
+        outer.addLayout(button_row)
 
-        # Output box
-        self.output = QTextEdit()
-        self.output.setReadOnly(True)
-        layout.addWidget(self.output, stretch=1)
+        # Tabs
+        self.tabs = QTabWidget()
+        outer.addWidget(self.tabs, stretch=1)
+
+        # Tab 1: Sažetak
+        summary_tab = QWidget()
+        summary_layout = QVBoxLayout(summary_tab)
+
+        self.summary_label = QLabel("Nema rezultata")
+        self.summary_label.setAlignment(Qt.AlignCenter)
+        self.summary_label.setStyleSheet("font-size: 26pt; font-weight: bold; color: gray;")
+        summary_layout.addWidget(self.summary_label)
+
+        info_label = QLabel(
+            "Kratki rezultat: 'ISTI MODELI' ili 'RAZLIČITI MODELI',\n"
+            "osnovne metrike i informacija iz interne baze (ranije viđeni modeli)."
+        )
+        info_label.setWordWrap(True)
+        summary_layout.addWidget(info_label)
+
+        self.summary_text = QTextEdit()
+        self.summary_text.setReadOnly(True)
+        summary_layout.addWidget(self.summary_text, stretch=1)
+
+        self.tabs.addTab(summary_tab, "Sažetak")
+
+        # Tab 2: Detalji
+        details_tab = QWidget()
+        details_layout = QVBoxLayout(details_tab)
+
+        self.details_text = QTextEdit()
+        self.details_text.setReadOnly(True)
+        details_layout.addWidget(self.details_text, stretch=1)
+
+        self.tabs.addTab(details_tab, "Detalji")
+
+        # Tab 3: 3D / razlike
+        diff_tab = QWidget()
+        diff_layout = QVBoxLayout(diff_tab)
+
+        diff_label = QLabel(
+            "Ovdje možeš otvoriti oba modela i eksportirati razlike (A−B, B−A)\n"
+            "u STEP datoteke za pregled u FreeCAD-u."
+        )
+        diff_label.setWordWrap(True)
+        diff_layout.addWidget(diff_label)
+
+        diff_button_row = QHBoxLayout()
+        open_a_btn = QPushButton("Otvori model A u FreeCAD")
+        open_a_btn.clicked.connect(self._open_a_in_freecad)
+        diff_button_row.addWidget(open_a_btn)
+
+        open_b_btn = QPushButton("Otvori model B u FreeCAD")
+        open_b_btn.clicked.connect(self._open_b_in_freecad)
+        diff_button_row.addWidget(open_b_btn)
+
+        export_diff_btn = QPushButton("Eksportiraj razlike (A−B, B−A)")
+        export_diff_btn.clicked.connect(self._export_diffs)
+        diff_button_row.addWidget(export_diff_btn)
+
+        diff_button_row.addStretch()
+        diff_layout.addLayout(diff_button_row)
+
+        self.diff_info_text = QTextEdit()
+        self.diff_info_text.setReadOnly(True)
+        diff_layout.addWidget(self.diff_info_text, stretch=1)
+
+        self.tabs.addTab(diff_tab, "3D / razlike")
+
+    # -------- DB path handling --------
+
+    def _update_db_path_display(self) -> None:
+        self.db_path_edit.setText(str(self.db_path))
+
+    def _choose_db_file(self) -> None:
+        """
+        Let user select or create a DB JSON.
+
+        - If file exists → load it.
+        - If not → create new empty DB in memory and use that path.
+        """
+        initial = str(self.db_path if self.db_path else DEFAULT_DB_PATH)
+        filename, _ = QFileDialog.getSaveFileName(
+            self,
+            "Odaberi ili kreiraj DB JSON datoteku",
+            initial,
+            "JSON files (*.json);;All files (*.*)",
+        )
+        if not filename:
+            return
+
+        new_path = Path(filename)
+        self.db_path = new_path
+        self.db, self.db_index = _load_db(self.db_path)
+        self._update_db_path_display()
+
+        QMessageBox.information(
+            self,
+            "DB postavljena",
+            f"Korištenje DB:\n{self.db_path}\n"
+            f"(trenutno zabilježenih modela: {len(self.db.get('models', []))})",
+        )
 
     # -------- Helpers --------
 
@@ -170,51 +374,160 @@ class ComparatorWindow(QWidget):
             QMessageBox.critical(self, "File not found", str(exc))
             return
         except Exception as exc:
-            QMessageBox.critical(self, "Comparison failed", f"Unexpected error: {exc}")
+            QMessageBox.critical(self, "Comparison failed", f"Unexpected error:\n{exc}")
             return
 
         self.latest_result = result
-        self._display_result(result)
 
-    def _display_result(self, result: ComparisonResult) -> None:
-        def fmt_descriptor(summary: GeometrySignature) -> str:
-            d = summary.descriptor
-            inertia = ", ".join(f"{v:.3f}" for v in d.inertia)
-            bbox = ", ".join(f"{v:.3f}" for v in d.bbox_dims)
-            face_hist = ", ".join(str(v) for v in d.face_hist)
-            edge_hist = ", ".join(str(v) for v in d.edge_hist)
-            return (
-                f"Path: {summary.path}\n"
-                f"Geometry hash: {summary.hash_hex}\n"
-                f"Volume: {d.volume}\n"
-                f"Surface area: {d.area}\n"
-                f"BBox dims (sorted): {bbox}\n"
-                f"Faces: {d.num_faces}, Edges: {d.num_edges}\n"
-                f"Principal inertia: {inertia}\n"
-                f"Centroid offset (from bbox center): {d.centroid_offset}\n"
-                f"Face area histogram: [{face_hist}]\n"
-                f"Edge length histogram: [{edge_hist}]\n"
+        # Update DB with A and B
+        self._update_db_with_signatures(result.summary_a, result.summary_b)
+
+        # Refresh UI
+        self._update_ui_with_result(result)
+
+    def _update_db_with_signatures(self, sig_a: GeometrySignature, sig_b: GeometrySignature) -> None:
+        _record_model(self.db, self.db_index, sig_a)
+        _record_model(self.db, self.db_index, sig_b)
+        try:
+            _save_db(self.db_path, self.db)
+        except Exception as exc:
+            QMessageBox.warning(self, "DB warning", f"Could not save DB:\n{exc}")
+
+    def _build_known_models_text(self, sig: GeometrySignature, label: str) -> str:
+        matches = _find_by_hash(self.db_index, sig.hash_hex)
+        if not matches:
+            return f"{label}: geometrija nije ranije zabilježena u ovoj bazi.\n"
+        lines = [f"{label}: geometrija već postoji u ovoj bazi, raniji modeli:\n"]
+        for m in matches:
+            lines.append(
+                f"  - {m.get('name')}  (putanja: {m.get('path')}, dodano: {m.get('added')})\n"
             )
+        return "".join(lines)
 
-        lines = [
-            "== Geometry summaries ==\n\n",
-            "File A:\n",
-            fmt_descriptor(result.summary_a),
-            "\nFile B:\n",
-            fmt_descriptor(result.summary_b),
-            "\n",
-        ]
-
-        if result.summary_a.hash_hex == result.summary_b.hash_hex:
-            lines.append("Geometries match (hashes are identical).\n")
+    def _update_ui_with_result(self, result: ComparisonResult) -> None:
+        # ----- 1) Summary label: ISTI / RAZLIČITI MODELI -----
+        if result.exact_match:
+            self.summary_label.setText("ISTI MODELI")
+            self.summary_label.setStyleSheet("font-size: 26pt; font-weight: bold; color: green;")
         else:
-            lines.append("Geometries differ (hashes are not identical).\n")
+            self.summary_label.setText("RAZLIČITI MODELI")
+            self.summary_label.setStyleSheet("font-size: 26pt; font-weight: bold; color: red;")
 
-        lines.append(
-            "\nHashes are derived from quantized geometry descriptors for robust deduplication.\n"
+        a = result.summary_a
+        b = result.summary_b
+        m = result.metrics
+
+        same_hash = (a.hash_hex == b.hash_hex)
+
+        # Short summary text (Sažetak tab)
+        summary_lines: list[str] = []
+        summary_lines.append(f"DB: {self.db_path}\n\n")
+        summary_lines.append(f"File A: {a.path}\nFile B: {b.path}\n\n")
+        summary_lines.append(f"Hash A: {a.hash_hex}\nHash B: {b.hash_hex}\n")
+        summary_lines.append(f"Hash isti: {'DA' if same_hash else 'NE'}\n\n")
+
+        summary_lines.append(self._build_known_models_text(a, "Model A"))
+        summary_lines.append("\n")
+        summary_lines.append(self._build_known_models_text(b, "Model B"))
+        summary_lines.append("\n")
+
+        summary_lines.append("Boolean metrike:\n")
+        summary_lines.append(f"  Volumen A:       {m.get('vol_a')}\n")
+        summary_lines.append(f"  Volumen B:       {m.get('vol_b')}\n")
+        summary_lines.append(f"  Volumen (A − B): {m.get('vol_ab')}\n")
+        summary_lines.append(f"  Volumen (B − A): {m.get('vol_ba')}\n\n")
+        summary_lines.append(
+            "Konačni zaključak:\n"
+            f"  {'ISTI MODELI' if result.exact_match else 'RAZLIČITI MODELI'}\n"
         )
 
-        self.output.setPlainText("".join(lines))
+        self.summary_text.setPlainText("".join(summary_lines))
+
+        # ----- 2) Detailed report (Detalji tab) -----
+        self.details_text.setPlainText(self._build_details_report(result))
+
+        # ----- 3) Diff tab info -----
+        self.diff_info_text.setPlainText(
+            "Klikni na 'Eksportiraj razlike (A−B, B−A)' za generiranje STEP datoteka "
+            "koje možeš otvoriti u FreeCAD-u za vizualnu provjeru.\n\n"
+            "Ako boolean operacije ne uspiju, aplikacija će ići na sigurnu stranu i "
+            "prijavit će 'RAZLIČITI MODELI'."
+        )
+
+        # Focus summary tab so user immediately sees ISTI/RAZLIČITI
+        self.tabs.setCurrentIndex(0)
+
+    def _build_details_report(self, result: ComparisonResult) -> str:
+        a = result.summary_a
+        b = result.summary_b
+
+        def fmt_descriptor(label: str, sig: GeometrySignature) -> str:
+            d = sig.descriptor
+
+            inertia = ", ".join(f"{v:.6g}" for v in d.inertia)
+            bbox = ", ".join(f"{v:.6g}" for v in d.bbox_dims)
+            face_hist = ", ".join(str(v) for v in d.face_hist)
+            edge_hist = ", ".join(str(v) for v in d.edge_hist)
+
+            ft_labels = ["plane", "cylinder", "cone", "sphere", "torus", "bspline", "other"]
+            et_labels = ["line", "circle", "ellipse", "bspline", "other"]
+            ft_counts = ", ".join(f"{name}={cnt}" for name, cnt in zip(ft_labels, d.face_type_counts))
+            et_counts = ", ".join(f"{name}={cnt}" for name, cnt in zip(et_labels, d.edge_type_counts))
+
+            tri_hist = ", ".join(str(v) for v in d.tri_area_hist)
+            mesh_edge_hist = ", ".join(str(v) for v in d.mesh_edge_hist)
+
+            return (
+                f"{label} path: {sig.path}\n"
+                f"{label} hash: {sig.hash_hex}\n"
+                f"{label} volume: {d.volume}\n"
+                f"{label} area:   {d.area}\n"
+                f"{label} bbox (sorted): [{bbox}]\n"
+                f"{label} faces: {d.num_faces}, edges: {d.num_edges}\n"
+                f"{label} inertia eigenvalues: [{inertia}]\n"
+                f"{label} centroid offset: {d.centroid_offset}\n"
+                f"{label} face area hist: [{face_hist}]\n"
+                f"{label} edge length hist: [{edge_hist}]\n"
+                f"{label} face type counts: {ft_counts}\n"
+                f"{label} edge type counts: {et_counts}\n"
+                f"{label} tri area hist (mesh): [{tri_hist}]\n"
+                f"{label} mesh edge hist: [{mesh_edge_hist}]\n"
+                f"{label} mesh hash: {d.mesh_hash}\n"
+            )
+
+        lines: list[str] = []
+        lines.append("== Geometry summaries ==\n\n")
+        lines.append(fmt_descriptor("A", a))
+        lines.append("\n")
+        lines.append(fmt_descriptor("B", b))
+        lines.append("\n")
+
+        same_hash = (a.hash_hex == b.hash_hex)
+        m = result.metrics
+
+        lines.append("== Match decision ==\n")
+        lines.append(f"Descriptor hashes identical: {'YES' if same_hash else 'NO'}\n")
+        if result.exact_match:
+            lines.append("Boolean A−B / B−A: NO remaining volume → exact.\n")
+            lines.append("FINAL: Geometries are considered EXACT MATCH.\n")
+        else:
+            lines.append("Boolean A−B / B−A: difference detected or boolean failed.\n")
+            lines.append("FINAL: Geometries are considered DIFFERENT.\n")
+
+        lines.append("\n== Boolean metrics ==\n")
+        lines.append(f"Volume A: {m.get('vol_a')}\n")
+        lines.append(f"Volume B: {m.get('vol_b')}\n")
+        lines.append(f"Area   A: {m.get('area_a')}\n")
+        lines.append(f"Area   B: {m.get('area_b')}\n")
+        lines.append(f"Volume(A − B): {m.get('vol_ab')}\n")
+        lines.append(f"Volume(B − A): {m.get('vol_ba')}\n")
+
+        lines.append(
+            "\nDescriptor + mesh hash + boolean difference make false positives "
+            "extremely unlikely. If boolean fails, tool errs on the SAFE side "
+            "(reports DIFFERENT).\n"
+        )
+        return "".join(lines)
 
     def _save_report(self) -> None:
         if self.latest_result is None:
@@ -222,22 +535,25 @@ class ComparatorWindow(QWidget):
             return
 
         result = self.latest_result
-        d_a = result.summary_a.descriptor
-        d_b = result.summary_b.descriptor
+        da = result.summary_a.descriptor
+        db = result.summary_b.descriptor
 
         data = {
             "tolerance": self.tolerance_input.text(),
+            "db_path": str(self.db_path),
             "file_a": {
                 "path": result.summary_a.path,
                 "hash": result.summary_a.hash_hex,
-                "descriptor": d_a.to_ordered_dict(),
+                "descriptor": da.to_ordered_dict(),
             },
             "file_b": {
                 "path": result.summary_b.path,
                 "hash": result.summary_b.hash_hex,
-                "descriptor": d_b.to_ordered_dict(),
+                "descriptor": db.to_ordered_dict(),
             },
             "hash_match": result.summary_a.hash_hex == result.summary_b.hash_hex,
+            "exact_match": result.exact_match,
+            "boolean_metrics": result.metrics,
         }
 
         filename, _ = QFileDialog.getSaveFileName(
@@ -251,19 +567,99 @@ class ComparatorWindow(QWidget):
                 json.dump(data, f, indent=2)
             QMessageBox.information(self, "Saved", f"Report saved to {filename}")
 
+    # -------- 3D / diff tab actions --------
+
+    def _get_freecad_exe(self) -> Path | None:
+        exe = Path(sys.executable).resolve()
+        root = exe.parent.parent  # bin -> root
+        candidate = root / "bin" / "FreeCAD.exe"
+        if candidate.is_file():
+            return candidate
+        return None
+
+    def _open_in_freecad(self, path: str) -> None:
+        freecad_exe = self._get_freecad_exe()
+        if freecad_exe is None:
+            QMessageBox.critical(self, "FreeCAD not found", "FreeCAD.exe not found next to python.exe.")
+            return
+        if not Path(path).is_file():
+            QMessageBox.critical(self, "File not found", f"File does not exist:\n{path}")
+            return
+        try:
+            subprocess.Popen([str(freecad_exe), path])
+        except Exception as exc:
+            QMessageBox.critical(self, "Error", f"Failed to launch FreeCAD:\n{exc}")
+
+    def _open_a_in_freecad(self) -> None:
+        path = self.file_a_input.text().strip()
+        if not path:
+            QMessageBox.information(self, "No file", "Select File A first.")
+            return
+        self._open_in_freecad(path)
+
+    def _open_b_in_freecad(self) -> None:
+        path = self.file_b_input.text().strip()
+        if not path:
+            QMessageBox.information(self, "No file", "Select File B first.")
+            return
+        self._open_in_freecad(path)
+
+    def _export_diffs(self) -> None:
+        if self.latest_result is None:
+            QMessageBox.information(self, "No comparison", "Run a comparison first.")
+            return
+
+        file_a = self.file_a_input.text().strip()
+        file_b = self.file_b_input.text().strip()
+        if not file_a or not file_b:
+            QMessageBox.information(self, "Missing files", "Select both files first.")
+            return
+
+        # Ask where to put diff files (default: user's home / step_compare_diffs)
+        default_dir = Path.home() / "step_compare_diffs"
+        target_dir_str = QFileDialog.getExistingDirectory(
+            self,
+            "Select folder for difference STEP files",
+            str(default_dir),
+        )
+        if not target_dir_str:
+            return
+
+        target_dir = Path(target_dir_str)
+        comparator = StepComparator(float(self.tolerance_input.text() or "0.001"))
+        try:
+            files = comparator.export_differences(file_a, file_b, target_dir)
+        except Exception as exc:
+            QMessageBox.critical(self, "Export failed", f"Failed to export difference shapes:\n{exc}")
+            return
+
+        info_lines = [
+            "Eksportirane STEP datoteke:\n",
+            f"  A_clean:    {files['A_clean']}\n",
+            f"  B_clean:    {files['B_clean']}\n",
+            f"  A_minus_B:  {files['A_minus_B']}\n",
+            f"  B_minus_A:  {files['B_minus_A']}\n\n",
+            "Otvori ih u FreeCAD-u za vizualnu provjeru razlika.\n",
+        ]
+        self.diff_info_text.setPlainText("".join(info_lines))
+
+        # Open folder in explorer for convenience
+        try:
+            os.startfile(str(target_dir))
+        except Exception:
+            pass
+
 
 def main() -> int:
     app = QApplication(sys.argv)
-
-    window = ComparatorWindow()
-    window.show()
+    win = ComparatorWindow()
+    win.show()
 
     # PySide6 has exec(), PySide2 has exec_()
     if hasattr(app, "exec"):
         return app.exec()
     else:
         return app.exec_()
-
 
 
 if __name__ == "__main__":
