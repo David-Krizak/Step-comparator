@@ -23,6 +23,9 @@ try:
         QTextEdit,
         QMessageBox,
         QTabWidget,
+        QTableWidget,
+        QTableWidgetItem,
+        QHeaderView,
     )
     from PySide6.QtCore import Qt
 except ImportError:
@@ -39,6 +42,9 @@ except ImportError:
         QTextEdit,
         QMessageBox,
         QTabWidget,
+        QTableWidget,
+        QTableWidgetItem,
+        QHeaderView,
     )
     from PySide2.QtCore import Qt
 
@@ -112,7 +118,7 @@ def _record_model(
         "hash": h,
         "name": Path(p).name,
         "path": p,
-        "added": datetime.now().isoformat(timespec="seconds"),
+        "added": datetime.now().strftime("%d.%m.%Y %H:%M"),
         "volume": d.volume,
         "area": d.area,
         "bbox": list(d.bbox_dims),
@@ -165,8 +171,10 @@ class ComparatorWindow(QWidget):
 
         self.tabs: QTabWidget
         self.summary_label: QLabel
+        self.known_badge: QLabel
         self.summary_text: QTextEdit
         self.details_text: QTextEdit
+        self.details_table: QTableWidget
         self.diff_info_text: QTextEdit
 
         self.latest_result: ComparisonResult | None = None
@@ -225,9 +233,12 @@ class ComparatorWindow(QWidget):
         button_row = QHBoxLayout()
         compare_button = QPushButton("Compare")
         compare_button.clicked.connect(self._compare)
+        single_check_button = QPushButton("Check model vs DB")
+        single_check_button.clicked.connect(self._check_single_against_db)
         save_button = QPushButton("Save report as JSON")
         save_button.clicked.connect(self._save_report)
         button_row.addWidget(compare_button)
+        button_row.addWidget(single_check_button)
         button_row.addWidget(save_button)
         button_row.addStretch()
         outer.addLayout(button_row)
@@ -242,8 +253,23 @@ class ComparatorWindow(QWidget):
 
         self.summary_label = QLabel("Nema rezultata")
         self.summary_label.setAlignment(Qt.AlignCenter)
-        self.summary_label.setStyleSheet("font-size: 26pt; font-weight: bold; color: gray;")
+        self.summary_label.setStyleSheet(
+            "font-size: 26pt; font-weight: 800; color: gray;"
+            "padding: 12px; border-radius: 12px;"
+            "background: qlineargradient(x1:0, y1:0, x2:1, y2:0,"
+            " stop:0 #f7f7f7, stop:1 #e1e1e1);"
+        )
         summary_layout.addWidget(self.summary_label)
+
+        self.known_badge = QLabel("")
+        self.known_badge.setAlignment(Qt.AlignCenter)
+        self.known_badge.setStyleSheet(
+            "font-size: 12pt; color: #1f3b57;"
+            "padding: 6px 10px; border: 1px solid #7ab0d4;"
+            "border-radius: 10px; background: #d9ecfa;"
+        )
+        self.known_badge.hide()
+        summary_layout.addWidget(self.known_badge)
 
         info_label = QLabel(
             "Kratki rezultat: 'ISTI MODELI' ili 'RAZLIČITI MODELI',\n"
@@ -262,8 +288,17 @@ class ComparatorWindow(QWidget):
         details_tab = QWidget()
         details_layout = QVBoxLayout(details_tab)
 
+        self.details_table = QTableWidget(0, 3)
+        self.details_table.setHorizontalHeaderLabels(["Metrika", "Model A", "Model B"])
+        self.details_table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
+        self.details_table.verticalHeader().setVisible(False)
+        self.details_table.setEditTriggers(QTableWidget.NoEditTriggers)
+        self.details_table.setAlternatingRowColors(True)
+        details_layout.addWidget(self.details_table)
+
         self.details_text = QTextEdit()
         self.details_text.setReadOnly(True)
+        self.details_text.setStyleSheet("font-family: Consolas, monospace;")
         details_layout.addWidget(self.details_text, stretch=1)
 
         self.tabs.addTab(details_tab, "Detalji")
@@ -337,6 +372,10 @@ class ComparatorWindow(QWidget):
 
     # -------- Helpers --------
 
+    def _get_existing_matches(self, sig: GeometrySignature) -> list[dict]:
+        """Copy of matches before we possibly add the current signature."""
+        return [dict(m) for m in _find_by_hash(self.db_index, sig.hash_hex)]
+
     def _choose_file(self, widget: QLineEdit) -> None:
         filename, _ = QFileDialog.getOpenFileName(
             self,
@@ -379,11 +418,55 @@ class ComparatorWindow(QWidget):
 
         self.latest_result = result
 
+        # Snapshot known matches before we add the current models to the DB index
+        existing_a = self._get_existing_matches(result.summary_a)
+        existing_b = self._get_existing_matches(result.summary_b)
+
         # Update DB with A and B
         self._update_db_with_signatures(result.summary_a, result.summary_b)
 
         # Refresh UI
-        self._update_ui_with_result(result)
+        self._update_ui_with_result(result, existing_a, existing_b)
+
+    def _check_single_against_db(self) -> None:
+        tol = self._parse_tolerance()
+        if tol is None:
+            return
+
+        file_a = self.file_a_input.text().strip()
+        file_b = self.file_b_input.text().strip()
+        if not file_a and not file_b:
+            QMessageBox.warning(self, "No file", "Select at least one STEP file to check against the DB.")
+            return
+
+        target_label, target_path = ("A", file_a) if file_a else ("B", file_b)
+
+        hasher = GeometryHasher(tol)
+        try:
+            sig = hasher.signature_for_file(target_path)
+        except FileNotFoundError:
+            QMessageBox.critical(self, "File not found", f"File does not exist:\n{target_path}")
+            return
+        except Exception as exc:
+            QMessageBox.critical(self, "Hashing failed", f"Unexpected error while reading file:\n{exc}")
+            return
+
+        matches_before = self._get_existing_matches(sig)
+        _record_model(self.db, self.db_index, sig)
+        try:
+            _save_db(self.db_path, self.db)
+        except Exception as exc:
+            QMessageBox.warning(self, "DB warning", f"Could not save DB:\n{exc}")
+
+        if matches_before:
+            text = self._build_known_models_text(f"Model {target_label}", matches_before)
+        else:
+            text = (
+                f"Model {target_label}: geometrija nije ranije zabilježena u ovoj bazi.\n"
+                f"Dodano je novo pojavljivanje ({Path(target_path).name})."
+            )
+
+        QMessageBox.information(self, "Provjera u bazi", text)
 
     def _update_db_with_signatures(self, sig_a: GeometrySignature, sig_b: GeometrySignature) -> None:
         _record_model(self.db, self.db_index, sig_a)
@@ -393,8 +476,7 @@ class ComparatorWindow(QWidget):
         except Exception as exc:
             QMessageBox.warning(self, "DB warning", f"Could not save DB:\n{exc}")
 
-    def _build_known_models_text(self, sig: GeometrySignature, label: str) -> str:
-        matches = _find_by_hash(self.db_index, sig.hash_hex)
+    def _build_known_models_text(self, label: str, matches: list[dict]) -> str:
         if not matches:
             return f"{label}: geometrija nije ranije zabilježena u ovoj bazi.\n"
         lines = [f"{label}: geometrija već postoji u ovoj bazi, raniji modeli:\n"]
@@ -404,14 +486,29 @@ class ComparatorWindow(QWidget):
             )
         return "".join(lines)
 
-    def _update_ui_with_result(self, result: ComparisonResult) -> None:
+    def _update_ui_with_result(
+        self,
+        result: ComparisonResult,
+        known_matches_a: list[dict],
+        known_matches_b: list[dict],
+    ) -> None:
         # ----- 1) Summary label: ISTI / RAZLIČITI MODELI -----
         if result.exact_match:
             self.summary_label.setText("ISTI MODELI")
-            self.summary_label.setStyleSheet("font-size: 26pt; font-weight: bold; color: green;")
+            self.summary_label.setStyleSheet(
+                "font-size: 26pt; font-weight: 800; color: white;"
+                "padding: 12px; border-radius: 12px;"
+                "background: qlineargradient(x1:0, y1:0, x2:1, y2:0,"
+                " stop:0 #3ba55d, stop:1 #2f8c4d);"
+            )
         else:
             self.summary_label.setText("RAZLIČITI MODELI")
-            self.summary_label.setStyleSheet("font-size: 26pt; font-weight: bold; color: red;")
+            self.summary_label.setStyleSheet(
+                "font-size: 26pt; font-weight: 800; color: white;"
+                "padding: 12px; border-radius: 12px;"
+                "background: qlineargradient(x1:0, y1:0, x2:1, y2:0,"
+                " stop:0 #d64b4b, stop:1 #b23333);"
+            )
 
         a = result.summary_a
         b = result.summary_b
@@ -426,9 +523,11 @@ class ComparatorWindow(QWidget):
         summary_lines.append(f"Hash A: {a.hash_hex}\nHash B: {b.hash_hex}\n")
         summary_lines.append(f"Hash isti: {'DA' if same_hash else 'NE'}\n\n")
 
-        summary_lines.append(self._build_known_models_text(a, "Model A"))
+        known_a = self._build_known_models_text("Model A", known_matches_a)
+        known_b = self._build_known_models_text("Model B", known_matches_b)
+        summary_lines.append(known_a)
         summary_lines.append("\n")
-        summary_lines.append(self._build_known_models_text(b, "Model B"))
+        summary_lines.append(known_b)
         summary_lines.append("\n")
 
         summary_lines.append("Boolean metrike:\n")
@@ -444,6 +543,7 @@ class ComparatorWindow(QWidget):
         self.summary_text.setPlainText("".join(summary_lines))
 
         # ----- 2) Detailed report (Detalji tab) -----
+        self._populate_details_table(result)
         self.details_text.setPlainText(self._build_details_report(result))
 
         # ----- 3) Diff tab info -----
@@ -456,6 +556,59 @@ class ComparatorWindow(QWidget):
 
         # Focus summary tab so user immediately sees ISTI/RAZLIČITI
         self.tabs.setCurrentIndex(0)
+
+        self._update_known_badge(result, known_matches_a, known_matches_b)
+
+    def _update_known_badge(
+        self,
+        result: ComparisonResult,
+        known_matches_a: list[dict],
+        known_matches_b: list[dict],
+    ) -> None:
+        has_known_a = bool(known_matches_a)
+        has_known_b = bool(known_matches_b)
+        same_hash = result.summary_a.hash_hex == result.summary_b.hash_hex
+
+        if has_known_a or has_known_b:
+            if same_hash:
+                text = "Modeli su poznati i imaju identičnu geometriju prema bazi."
+            elif has_known_a and has_known_b:
+                text = "Oba modela su ranije viđena (različite geometrije)."
+            elif has_known_a:
+                text = "Model A je ranije zabilježen u bazi."
+            else:
+                text = "Model B je ranije zabilježen u bazi."
+            self.known_badge.setText(text)
+            self.known_badge.show()
+        else:
+            self.known_badge.hide()
+
+    def _populate_details_table(self, result: ComparisonResult) -> None:
+        a = result.summary_a.descriptor
+        b = result.summary_b.descriptor
+
+        def fmt_list(values) -> str:
+            return ", ".join(f"{v:.6g}" for v in values)
+
+        rows = [
+            ("Volumen", f"{a.volume:.6g}", f"{b.volume:.6g}"),
+            ("Površina", f"{a.area:.6g}", f"{b.area:.6g}"),
+            ("BBox dimenzije", fmt_list(a.bbox_dims), fmt_list(b.bbox_dims)),
+            ("Broj lica", str(a.num_faces), str(b.num_faces)),
+            ("Broj bridova", str(a.num_edges), str(b.num_edges)),
+            ("Centroid offset", f"{a.centroid_offset:.6g}", f"{b.centroid_offset:.6g}"),
+            ("Inercija eigenvalues", fmt_list(a.inertia), fmt_list(b.inertia)),
+            ("Face hash", a.mesh_hash, b.mesh_hash),
+        ]
+
+        self.details_table.setRowCount(len(rows))
+        for r, (metric, val_a, val_b) in enumerate(rows):
+            for c, value in enumerate((metric, val_a, val_b)):
+                item = QTableWidgetItem(value)
+                item.setFlags(item.flags() ^ Qt.ItemIsEditable)
+                self.details_table.setItem(r, c, item)
+
+        self.details_table.resizeRowsToContents()
 
     def _build_details_report(self, result: ComparisonResult) -> str:
         a = result.summary_a
