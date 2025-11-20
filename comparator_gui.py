@@ -523,8 +523,8 @@ class ComparatorWindow(QWidget):
         summary_lines.append(f"Hash A: {a.hash_hex}\nHash B: {b.hash_hex}\n")
         summary_lines.append(f"Hash isti: {'DA' if same_hash else 'NE'}\n\n")
 
-        known_a = self._build_known_models_text("Model A", known_matches_a)
-        known_b = self._build_known_models_text("Model B", known_matches_b)
+        known_a = self._build_known_models_text(a, "Model A")
+        known_b = self._build_known_models_text(b, "Model B")
         summary_lines.append(known_a)
         summary_lines.append("\n")
         summary_lines.append(known_b)
@@ -557,16 +557,11 @@ class ComparatorWindow(QWidget):
         # Focus summary tab so user immediately sees ISTI/RAZLIČITI
         self.tabs.setCurrentIndex(0)
 
-        self._update_known_badge(result, known_matches_a, known_matches_b)
+        self._update_known_badge(result, known_a, known_b)
 
-    def _update_known_badge(
-        self,
-        result: ComparisonResult,
-        known_matches_a: list[dict],
-        known_matches_b: list[dict],
-    ) -> None:
-        has_known_a = bool(known_matches_a)
-        has_known_b = bool(known_matches_b)
+    def _update_known_badge(self, result: ComparisonResult, known_a: str, known_b: str) -> None:
+        has_known_a = "već postoji" in known_a
+        has_known_b = "već postoji" in known_b
         same_hash = result.summary_a.hash_hex == result.summary_b.hash_hex
 
         if has_known_a or has_known_b:
