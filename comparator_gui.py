@@ -235,10 +235,13 @@ class ComparatorWindow(QWidget):
         compare_button.clicked.connect(self._compare)
         single_check_button = QPushButton("Check model vs DB")
         single_check_button.clicked.connect(self._check_single_against_db)
+        hash_folder_button = QPushButton("Hash folder to DB")
+        hash_folder_button.clicked.connect(self._hash_folder_to_db)
         save_button = QPushButton("Save report as JSON")
         save_button.clicked.connect(self._save_report)
         button_row.addWidget(compare_button)
         button_row.addWidget(single_check_button)
+        button_row.addWidget(hash_folder_button)
         button_row.addWidget(save_button)
         button_row.addStretch()
         outer.addLayout(button_row)
@@ -467,6 +470,91 @@ class ComparatorWindow(QWidget):
             )
 
         QMessageBox.information(self, "Provjera u bazi", text)
+
+    def _hash_folder_to_db(self) -> None:
+        tol = self._parse_tolerance()
+        if tol is None:
+            return
+
+        folder_str = QFileDialog.getExistingDirectory(
+            self,
+            "Select folder with STEP files",
+            str(Path.home()),
+        )
+        if not folder_str:
+            return
+
+        folder_path = Path(folder_str)
+        step_files = [
+            p
+            for p in folder_path.rglob("*")
+            if p.is_file() and p.suffix.lower() in {".step", ".stp"}
+        ]
+
+        if not step_files:
+            self.summary_label.setText("Nema STEP datoteka")
+            self.summary_label.setStyleSheet(
+                "font-size: 20pt; font-weight: 700; color: #555;"
+                "padding: 12px; border-radius: 12px;"
+                "background: qlineargradient(x1:0, y1:0, x2:1, y2:0," 
+                " stop:0 #f7f7f7, stop:1 #e1e1e1);"
+            )
+            self.summary_text.setPlainText(
+                f"Odabrani folder: {folder_path}\nNisu pronađene STEP datoteke (.step/.stp)."
+            )
+            self.tabs.setCurrentIndex(0)
+            return
+
+        hasher = GeometryHasher(tol)
+        lines: list[str] = []
+        lines.append(f"Folder hashing → DB: {self.db_path}\n")
+        lines.append(f"Izvorni folder: {folder_path}\n")
+        lines.append(f"Pronađeno datoteka: {len(step_files)}\n\n")
+
+        added_count = 0
+        for file_path in sorted(step_files):
+            try:
+                sig = hasher.signature_for_file(file_path)
+            except Exception as exc:
+                lines.append(f"- {file_path.name}: greška pri čitanju ({exc})\n")
+                continue
+
+            matches_before = self._get_existing_matches(sig)
+            if matches_before:
+                lines.append(f"- {file_path.name}: već postoji (hash {sig.hash_hex})\n")
+                for m in matches_before:
+                    lines.append(
+                        "    • "
+                        f"{m.get('name')} (putanja: {m.get('path')}, dodano: {m.get('added')})\n"
+                    )
+            else:
+                lines.append(f"- {file_path.name}: nova geometrija (hash {sig.hash_hex})\n")
+
+            before_len = len(self.db.get("models", []))
+            _record_model(self.db, self.db_index, sig)
+            if len(self.db.get("models", [])) > before_len:
+                added_count += 1
+
+        try:
+            _save_db(self.db_path, self.db)
+        except Exception as exc:
+            lines.append(f"\nUpozorenje: spremanje baze nije uspjelo ({exc}).\n")
+
+        lines.append("\nSažetak:\n")
+        lines.append(f"  Obrađeno: {len(step_files)} datoteka\n")
+        lines.append(f"  Novi zapisi u bazi: {added_count}\n")
+
+        self.summary_label.setText("Batch hash izvještaj")
+        self.summary_label.setStyleSheet(
+            "font-size: 22pt; font-weight: 800; color: #1f3b57;"
+            "padding: 12px; border-radius: 12px;"
+            "background: qlineargradient(x1:0, y1:0, x2:1, y2:0,"
+            " stop:0 #d9ecfa, stop:1 #b9d8f5);"
+        )
+
+        self.known_badge.hide()
+        self.summary_text.setPlainText("".join(lines))
+        self.tabs.setCurrentIndex(0)
 
     def _update_db_with_signatures(self, sig_a: GeometrySignature, sig_b: GeometrySignature) -> None:
         _record_model(self.db, self.db_index, sig_a)
