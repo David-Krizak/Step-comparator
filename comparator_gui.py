@@ -1,98 +1,26 @@
-import hashlib
 import json
-import re
 import sys
 import tkinter as tk
-from collections import Counter
 from dataclasses import dataclass
-from pathlib import Path
 from tkinter import filedialog, messagebox, scrolledtext
-from typing import Iterable, List
 
-FLOAT_PATTERN = re.compile(r"[-+]?\d*\.\d+(?:[eE][-+]?\d+)?|[-+]?\d+")
-
-
-@dataclass
-class StepSummary:
-    path: str
-    tolerance: float
-    float_count: int
-    min_value: float | None
-    max_value: float | None
-    hash_hex: str
+from geometry_descriptor import GeometryHasher, GeometrySignature
 
 
 @dataclass
 class ComparisonResult:
-    summary_a: StepSummary
-    summary_b: StepSummary
-    unmatched_from_a: List[float]
-    unmatched_from_b: List[float]
+    summary_a: GeometrySignature
+    summary_b: GeometrySignature
 
 
 class StepComparator:
     def __init__(self, tolerance: float) -> None:
-        self.tolerance = tolerance
-
-    def _extract_numbers(self, content: str) -> List[float]:
-        numbers = [float(match) for match in FLOAT_PATTERN.findall(content)]
-        return numbers
-
-    def _normalized_tokens(self, numbers: Iterable[float]) -> List[str]:
-        # Normalize numbers by rounding to tolerance and using scientific notation for stability
-        normalized = []
-        tol = self.tolerance if self.tolerance > 0 else 1e-6
-        for value in numbers:
-            scaled = round(value / tol)
-            normalized.append(f"{scaled}")
-        return normalized
-
-    def _hash_tokens(self, tokens: Iterable[str]) -> str:
-        digest = hashlib.sha256()
-        for token in tokens:
-            digest.update(token.encode("utf-8"))
-            digest.update(b"\0")
-        return digest.hexdigest()
-
-    def _summarize(self, path: str, numbers: List[float]) -> StepSummary:
-        tokens = self._normalized_tokens(numbers)
-        digest = self._hash_tokens(tokens)
-        min_value = min(numbers) if numbers else None
-        max_value = max(numbers) if numbers else None
-        return StepSummary(
-            path=path,
-            tolerance=self.tolerance,
-            float_count=len(numbers),
-            min_value=min_value,
-            max_value=max_value,
-            hash_hex=digest,
-        )
+        self.hasher = GeometryHasher(tolerance)
 
     def compare(self, path_a: str, path_b: str) -> ComparisonResult:
-        content_a = Path(path_a).read_text(errors="ignore")
-        content_b = Path(path_b).read_text(errors="ignore")
-
-        numbers_a = self._extract_numbers(content_a)
-        numbers_b = self._extract_numbers(content_b)
-
-        tokens_a = self._normalized_tokens(numbers_a)
-        tokens_b = self._normalized_tokens(numbers_b)
-
-        counter_a = Counter(tokens_a)
-        counter_b = Counter(tokens_b)
-
-        diff_a = []
-        diff_b = []
-
-        for token, count in (counter_a - counter_b).items():
-            diff_a.extend([float(token) * self.tolerance for _ in range(count)])
-        for token, count in (counter_b - counter_a).items():
-            diff_b.extend([float(token) * self.tolerance for _ in range(count)])
-
-        summary_a = self._summarize(path_a, numbers_a)
-        summary_b = self._summarize(path_b, numbers_b)
-
-        return ComparisonResult(summary_a, summary_b, diff_a, diff_b)
+        summary_a = self.hasher.signature_for_file(path_a)
+        summary_b = self.hasher.signature_for_file(path_b)
+        return ComparisonResult(summary_a, summary_b)
 
 
 class ComparatorApp(tk.Tk):
@@ -103,14 +31,14 @@ class ComparatorApp(tk.Tk):
         self._build_widgets()
 
     def _build_widgets(self) -> None:
-        header = tk.Label(self, text="STEP Comparator", font=("Segoe UI", 18, "bold"))
+        header = tk.Label(self, text="STEP Geometry Comparator", font=("Segoe UI", 18, "bold"))
         header.pack(pady=(12, 6))
 
         description = tk.Label(
             self,
             text=(
-                "Compare two STEP files by their numeric contents. "
-                "Values are normalized using a tolerance to generate comparable hashes."
+                "Compare two STEP files using geometry descriptors (volume, area, inertia, and more). "
+                "Descriptors are quantized using the tolerance to build a stable geometry hash."
             ),
             wraplength=760,
             justify="left",
@@ -184,34 +112,35 @@ class ComparatorApp(tk.Tk):
     def _display_result(self, result: ComparisonResult) -> None:
         self.output.delete("1.0", tk.END)
 
-        def fmt_summary(summary: StepSummary) -> str:
+        def fmt_descriptor(summary: GeometrySignature) -> str:
+            descriptor = summary.descriptor
+            inertia = ", ".join(f"{v:.3f}" for v in descriptor.inertia)
+            bbox = ", ".join(f"{v:.3f}" for v in descriptor.bbox_dims)
+            face_hist = ", ".join(str(v) for v in descriptor.face_hist)
+            edge_hist = ", ".join(str(v) for v in descriptor.edge_hist)
             return (
                 f"Path: {summary.path}\n"
-                f"Tolerance: {summary.tolerance}\n"
-                f"Numbers found: {summary.float_count}\n"
-                f"Min value: {summary.min_value}\n"
-                f"Max value: {summary.max_value}\n"
-                f"Hash: {summary.hash_hex}\n"
+                f"Geometry hash: {summary.hash_hex}\n"
+                f"Volume: {descriptor.volume}\n"
+                f"Surface area: {descriptor.area}\n"
+                f"BBox dims (sorted): {bbox}\n"
+                f"Faces: {descriptor.num_faces}, Edges: {descriptor.num_edges}\n"
+                f"Principal inertia: {inertia}\n"
+                f"Centroid offset (from bbox center): {descriptor.centroid_offset}\n"
+                f"Face area histogram: [{face_hist}]\n"
+                f"Edge length histogram: [{edge_hist}]\n"
             )
 
-        lines = ["== Summary ==\n", "File A:\n", fmt_summary(result.summary_a), "File B:\n", fmt_summary(result.summary_b)]
+        lines = ["== Geometry summaries ==\n", "File A:\n", fmt_descriptor(result.summary_a), "File B:\n", fmt_descriptor(result.summary_b)]
 
-        if result.unmatched_from_a or result.unmatched_from_b:
-            lines.append("Differences detected (normalized by tolerance):\n")
-            if result.unmatched_from_a:
-                sample = ", ".join(f"{v:.6f}" for v in result.unmatched_from_a[:10])
-                lines.append(f"Values only in A (first 10): {sample}\n")
-            if result.unmatched_from_b:
-                sample = ", ".join(f"{v:.6f}" for v in result.unmatched_from_b[:10])
-                lines.append(f"Values only in B (first 10): {sample}\n")
+        if result.summary_a.hash_hex == result.summary_b.hash_hex:
+            lines.append("\nGeometries match (hashes are identical).\n")
         else:
-            lines.append("No numeric differences detected within tolerance.\n")
+            lines.append("\nGeometries differ (hashes are not identical).\n")
 
-        lines.append(
-            "Hashes are generated from normalized numeric tokens and can be stored for future comparisons."
-        )
+        lines.append("Hashes are derived from quantized geometry descriptors for robust deduplication.")
 
-        self.output.insert(tk.END, "".join(lines))
+        self.output.insert(tk.END, "\n".join(lines))
 
     def _save_report(self) -> None:
         if not hasattr(self, "latest_result"):
@@ -219,11 +148,18 @@ class ComparatorApp(tk.Tk):
             return
         result: ComparisonResult = self.latest_result  # type: ignore[attr-defined]
         data = {
-            "tolerance": result.summary_a.tolerance,
-            "file_a": result.summary_a.__dict__,
-            "file_b": result.summary_b.__dict__,
-            "unmatched_from_a": result.unmatched_from_a,
-            "unmatched_from_b": result.unmatched_from_b,
+            "tolerance": self.tolerance_var.get(),
+            "file_a": {
+                "path": result.summary_a.path,
+                "hash": result.summary_a.hash_hex,
+                "descriptor": result.summary_a.descriptor.to_ordered_dict(),
+            },
+            "file_b": {
+                "path": result.summary_b.path,
+                "hash": result.summary_b.hash_hex,
+                "descriptor": result.summary_b.descriptor.to_ordered_dict(),
+            },
+            "hash_match": result.summary_a.hash_hex == result.summary_b.hash_hex,
         }
         filename = filedialog.asksaveasfilename(defaultextension=".json", filetypes=[("JSON", "*.json")])
         if filename:
