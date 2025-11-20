@@ -23,7 +23,7 @@ class StepComparator:
         return ComparisonResult(summary_a, summary_b)
 
 
-class ComparatorApp(tk.Tk):
+class ComparatorWindow(QWidget):
     def __init__(self) -> None:
         super().__init__()
         self.title("STEP Comparator")
@@ -43,71 +43,84 @@ class ComparatorApp(tk.Tk):
             wraplength=760,
             justify="left",
         )
-        description.pack(pady=(0, 12))
+        description.setWordWrap(True)
+        layout.addWidget(description)
 
-        form = tk.Frame(self)
-        form.pack(fill="x", padx=14, pady=(0, 10))
+        form_layout = QGridLayout()
+        layout.addLayout(form_layout)
 
-        # File A
-        tk.Label(form, text="File A:").grid(row=0, column=0, sticky="e", padx=4, pady=4)
-        self.file_a_var = tk.StringVar()
-        tk.Entry(form, textvariable=self.file_a_var, width=70).grid(row=0, column=1, padx=4, pady=4)
-        tk.Button(form, text="Browse", command=lambda: self._choose_file(self.file_a_var)).grid(row=0, column=2, padx=4, pady=4)
+        self.file_a_input = QLineEdit()
+        browse_a = QPushButton("Browse")
+        browse_a.clicked.connect(lambda: self._choose_file(self.file_a_input))
 
-        # File B
-        tk.Label(form, text="File B:").grid(row=1, column=0, sticky="e", padx=4, pady=4)
-        self.file_b_var = tk.StringVar()
-        tk.Entry(form, textvariable=self.file_b_var, width=70).grid(row=1, column=1, padx=4, pady=4)
-        tk.Button(form, text="Browse", command=lambda: self._choose_file(self.file_b_var)).grid(row=1, column=2, padx=4, pady=4)
+        self.file_b_input = QLineEdit()
+        browse_b = QPushButton("Browse")
+        browse_b.clicked.connect(lambda: self._choose_file(self.file_b_input))
 
-        # Tolerance
-        tk.Label(form, text="Tolerance:").grid(row=2, column=0, sticky="e", padx=4, pady=4)
-        self.tolerance_var = tk.StringVar(value="0.001")
-        tk.Entry(form, textvariable=self.tolerance_var, width=15).grid(row=2, column=1, sticky="w", padx=4, pady=4)
+        self.tolerance_input = QLineEdit("0.001")
 
-        tk.Button(self, text="Compare", command=self._compare).pack(pady=6)
-        tk.Button(self, text="Save report as JSON", command=self._save_report).pack(pady=2)
+        form_layout.addWidget(QLabel("File A:"), 0, 0, alignment=Qt.AlignRight)
+        form_layout.addWidget(self.file_a_input, 0, 1)
+        form_layout.addWidget(browse_a, 0, 2)
 
-        self.output = scrolledtext.ScrolledText(self, wrap="word", width=100, height=24)
-        self.output.pack(padx=12, pady=10, fill="both", expand=True)
+        form_layout.addWidget(QLabel("File B:"), 1, 0, alignment=Qt.AlignRight)
+        form_layout.addWidget(self.file_b_input, 1, 1)
+        form_layout.addWidget(browse_b, 1, 2)
 
-    def _choose_file(self, variable: tk.StringVar) -> None:
-        filename = filedialog.askopenfilename(filetypes=[("STEP files", "*.step *.stp"), ("All files", "*.*")])
+        form_layout.addWidget(QLabel("Tolerance:"), 2, 0, alignment=Qt.AlignRight)
+        form_layout.addWidget(self.tolerance_input, 2, 1)
+
+        button_row = QHBoxLayout()
+        compare_button = QPushButton("Compare")
+        compare_button.clicked.connect(self._compare)
+        save_button = QPushButton("Save report as JSON")
+        save_button.clicked.connect(self._save_report)
+        button_row.addWidget(compare_button)
+        button_row.addWidget(save_button)
+        layout.addLayout(button_row)
+
+        self.output = QTextEdit()
+        self.output.setReadOnly(True)
+        self.output.setLineWrapMode(QTextEdit.WidgetWidth)
+        layout.addWidget(self.output, stretch=1)
+
+    def _choose_file(self, widget: QLineEdit) -> None:
+        filename, _ = QFileDialog.getOpenFileName(self, "Select STEP file", str(Path.home()), "STEP files (*.step *.stp);;All files (*.*)")
         if filename:
-            variable.set(filename)
+            widget.setText(filename)
 
     def _parse_tolerance(self) -> float | None:
         try:
-            tol = float(self.tolerance_var.get())
+            tol = float(self.tolerance_input.text())
             if tol <= 0:
                 raise ValueError
             return tol
         except ValueError:
-            messagebox.showerror("Invalid tolerance", "Please enter a positive numeric tolerance.")
+            QMessageBox.critical(self, "Invalid tolerance", "Please enter a positive numeric tolerance.")
             return None
 
     def _compare(self) -> None:
-        file_a = self.file_a_var.get().strip()
-        file_b = self.file_b_var.get().strip()
+        file_a = self.file_a_input.text().strip()
+        file_b = self.file_b_input.text().strip()
         tol = self._parse_tolerance()
-        if not tol:
+        if tol is None:
             return
         if not file_a or not file_b:
-            messagebox.showwarning("Files missing", "Please select both STEP files before comparing.")
+            QMessageBox.warning(self, "Files missing", "Please select both STEP files before comparing.")
             return
 
         comparator = StepComparator(tol)
         try:
             result = comparator.compare(file_a, file_b)
         except FileNotFoundError as exc:
-            messagebox.showerror("File not found", str(exc))
+            QMessageBox.critical(self, "File not found", str(exc))
             return
-        except Exception as exc:  # noqa: BLE001 - surface errors to the user
-            messagebox.showerror("Comparison failed", f"Unexpected error: {exc}")
+        except Exception as exc:  # noqa: BLE001 - display to user
+            QMessageBox.critical(self, "Comparison failed", f"Unexpected error: {exc}")
             return
 
-        self._display_result(result)
         self.latest_result = result
+        self._display_result(result)
 
     def _display_result(self, result: ComparisonResult) -> None:
         self.output.delete("1.0", tk.END)
@@ -143,10 +156,11 @@ class ComparatorApp(tk.Tk):
         self.output.insert(tk.END, "\n".join(lines))
 
     def _save_report(self) -> None:
-        if not hasattr(self, "latest_result"):
-            messagebox.showinfo("Nothing to save", "Run a comparison first.")
+        if self.latest_result is None:
+            QMessageBox.information(self, "Nothing to save", "Run a comparison first.")
             return
-        result: ComparisonResult = self.latest_result  # type: ignore[attr-defined]
+
+        result = self.latest_result
         data = {
             "tolerance": self.tolerance_var.get(),
             "file_a": {
@@ -161,17 +175,19 @@ class ComparatorApp(tk.Tk):
             },
             "hash_match": result.summary_a.hash_hex == result.summary_b.hash_hex,
         }
-        filename = filedialog.asksaveasfilename(defaultextension=".json", filetypes=[("JSON", "*.json")])
+
+        filename, _ = QFileDialog.getSaveFileName(self, "Save JSON report", str(Path.home()), "JSON files (*.json)")
         if filename:
             with open(filename, "w", encoding="utf-8") as f:
                 json.dump(data, f, indent=2)
-            messagebox.showinfo("Saved", f"Report saved to {filename}")
+            QMessageBox.information(self, "Saved", f"Report saved to {filename}")
 
 
 def main() -> int:
-    app = ComparatorApp()
-    app.mainloop()
-    return 0
+    app = QApplication(sys.argv)
+    window = ComparatorWindow()
+    window.show()
+    return app.exec()
 
 
 if __name__ == "__main__":
