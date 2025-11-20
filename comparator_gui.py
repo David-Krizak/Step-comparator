@@ -487,10 +487,10 @@ class ComparatorWindow(QWidget):
         return "".join(lines)
 
     def _update_ui_with_result(
-        self,
-        result: ComparisonResult,
-        known_matches_a: list[dict],
-        known_matches_b: list[dict],
+            self,
+            result: ComparisonResult,
+            known_matches_a: list[dict],
+            known_matches_b: list[dict],
     ) -> None:
         # ----- 1) Summary label: ISTI / RAZLIČITI MODELI -----
         if result.exact_match:
@@ -516,15 +516,16 @@ class ComparatorWindow(QWidget):
 
         same_hash = (a.hash_hex == b.hash_hex)
 
-        # Short summary text (Sažetak tab)
         summary_lines: list[str] = []
         summary_lines.append(f"DB: {self.db_path}\n\n")
         summary_lines.append(f"File A: {a.path}\nFile B: {b.path}\n\n")
         summary_lines.append(f"Hash A: {a.hash_hex}\nHash B: {b.hash_hex}\n")
         summary_lines.append(f"Hash isti: {'DA' if same_hash else 'NE'}\n\n")
 
-        known_a = self._build_known_models_text(a, "Model A")
-        known_b = self._build_known_models_text(b, "Model B")
+        # Tekst za poznate modele
+        known_a = self._build_known_models_text("Model A", known_matches_a)
+        known_b = self._build_known_models_text("Model B", known_matches_b)
+
         summary_lines.append(known_a)
         summary_lines.append("\n")
         summary_lines.append(known_b)
@@ -554,9 +555,10 @@ class ComparatorWindow(QWidget):
             "prijavit će 'RAZLIČITI MODELI'."
         )
 
-        # Focus summary tab so user immediately sees ISTI/RAZLIČITI
+        # Fokus na Sažetak
         self.tabs.setCurrentIndex(0)
 
+        # OVDJE je bila greška – sad šaljemo stvarne stringove
         self._update_known_badge(result, known_a, known_b)
 
     def _update_known_badge(self, result: ComparisonResult, known_a: str, known_b: str) -> None:
