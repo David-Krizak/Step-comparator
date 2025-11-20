@@ -1,47 +1,8 @@
-from __future__ import annotations
-
 import json
 import sys
+import tkinter as tk
 from dataclasses import dataclass
-from pathlib import Path
-
-try:  # Prefer PySide6, fall back to PySide2
-    from PySide6.QtCore import Qt
-    from PySide6.QtGui import QFont
-    from PySide6.QtWidgets import (
-        QApplication,
-        QFileDialog,
-        QGridLayout,
-        QHBoxLayout,
-        QLabel,
-        QLineEdit,
-        QMessageBox,
-        QPushButton,
-        QTextEdit,
-        QVBoxLayout,
-        QWidget,
-    )
-except ImportError:
-    try:
-        from PySide2.QtCore import Qt
-        from PySide2.QtGui import QFont
-        from PySide2.QtWidgets import (
-            QApplication,
-            QFileDialog,
-            QGridLayout,
-            QHBoxLayout,
-            QLabel,
-            QLineEdit,
-            QMessageBox,
-            QPushButton,
-            QTextEdit,
-            QVBoxLayout,
-            QWidget,
-        )
-    except ImportError as exc:  # pragma: no cover - runtime dependency check
-        raise ImportError(
-            "PySide6 or PySide2 is required to run the Qt GUI. Install with `pip install PySide6` or `pip install PySide2`."
-        ) from exc
+from tkinter import filedialog, messagebox, scrolledtext
 
 from geometry_descriptor import GeometryHasher, GeometrySignature
 
@@ -65,23 +26,22 @@ class StepComparator:
 class ComparatorWindow(QWidget):
     def __init__(self) -> None:
         super().__init__()
-        self.setWindowTitle("STEP Comparator (Qt)")
-        self.setMinimumSize(860, 720)
-        self.latest_result: ComparisonResult | None = None
-        self._build_ui()
+        self.title("STEP Comparator")
+        self.geometry("820x700")
+        self._build_widgets()
 
-    def _build_ui(self) -> None:
-        layout = QVBoxLayout(self)
+    def _build_widgets(self) -> None:
+        header = tk.Label(self, text="STEP Geometry Comparator", font=("Segoe UI", 18, "bold"))
+        header.pack(pady=(12, 6))
 
-        header = QLabel("STEP Geometry Comparator")
-        header.setFont(QFont("Segoe UI", 18, QFont.Bold))
-        layout.addWidget(header)
-
-        description = QLabel(
-            (
+        description = tk.Label(
+            self,
+            text=(
                 "Compare two STEP files using geometry descriptors (volume, area, inertia, and more). "
                 "Descriptors are quantized using the tolerance to build a stable geometry hash."
-            )
+            ),
+            wraplength=760,
+            justify="left",
         )
         description.setWordWrap(True)
         layout.addWidget(description)
@@ -163,6 +123,8 @@ class ComparatorWindow(QWidget):
         self._display_result(result)
 
     def _display_result(self, result: ComparisonResult) -> None:
+        self.output.delete("1.0", tk.END)
+
         def fmt_descriptor(summary: GeometrySignature) -> str:
             descriptor = summary.descriptor
             inertia = ", ".join(f"{v:.3f}" for v in descriptor.inertia)
@@ -190,7 +152,8 @@ class ComparatorWindow(QWidget):
             lines.append("\nGeometries differ (hashes are not identical).\n")
 
         lines.append("Hashes are derived from quantized geometry descriptors for robust deduplication.")
-        self.output.setPlainText("\n".join(lines))
+
+        self.output.insert(tk.END, "\n".join(lines))
 
     def _save_report(self) -> None:
         if self.latest_result is None:
@@ -199,7 +162,7 @@ class ComparatorWindow(QWidget):
 
         result = self.latest_result
         data = {
-            "tolerance": self.tolerance_input.text(),
+            "tolerance": self.tolerance_var.get(),
             "file_a": {
                 "path": result.summary_a.path,
                 "hash": result.summary_a.hash_hex,
